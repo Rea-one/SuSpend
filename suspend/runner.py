@@ -77,7 +77,7 @@ def main():
     predicted_text = encoder.decode(predictions[0])
     print(f"输入文本：{input_text}")
     print(f"预测结果：{predicted_text}")
-
+    
 
 if __name__ == "__main__":
     main()

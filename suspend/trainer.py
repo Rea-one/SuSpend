@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
@@ -55,6 +56,7 @@ OUTPUT_SIZE = vocab_size
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = Suspend(voc_size=vocab_size, output_size=OUTPUT_SIZE).to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-6)
 criterion = nn.CrossEntropyLoss()
 
 # ================== 添加模型保存相关配置 ==================
@@ -134,7 +136,14 @@ for epoch in range(EPOCHS):
     # ================== 添加模型保存逻辑 ==================
     if (epoch + 1) % save_interval == 0:
         model_save_path = os.path.join(save_dir, f"suspend_model_epoch_{epoch+1}.pth")
-        torch.save(model.state_dict(), model_save_path)
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': val_loss,
+        }, model_save_path)
+        print(f"Model saved at epoch {epoch+1} to {model_save_path}")
         print(f"第 {epoch+1} 轮训练完成，模型已保存到 {model_save_path}")
 
 
