@@ -1,104 +1,83 @@
 # runner.py
+
+import os
 import torch
-from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from torchtext.datasets import AG_NEWS
-from torchtext.vocab import build_vocab_from_iterator
-import torch.nn as nn
+import numpy as np
+import tiktoken
 
-# ================== 1. 数据预处理 ==================
-def collate_batch(batch):
-    label_pipeline = lambda x: int(x) - 1
-    text_pipeline = lambda x: x.split()
-
-    def yield_tokens(data_iter):
-        for _, text in data_iter:
-            yield text_pipeline(text)
-
-    vocab = build_vocab_from_iterator(yield_tokens(AG_NEWS(split="train")),
-                                      specials=["<unk>"])
-    vocab.set_default_index(vocab["<unk>"])
-
-    label_list, text_list, length_list = [], [], []
-    for (_label, _text) in batch:
-        label_list.append(label_pipeline(_label))
-        processed_text = torch.tensor(vocab(text_pipeline(_text)), dtype=torch.long)
-        text_list.append(processed_text)
-        length_list.append(processed_text.shape[0])
-
-    label_tensor = torch.tensor(label_list, dtype=torch.long)
-    text_tensor = pad_sequence(text_list, batch_first=False)
-    length_tensor = torch.tensor(length_list, dtype=torch.int64)
-
-    return text_tensor, label_tensor, length_tensor
+from suspend import Suspend
+from attention import LocalAttention
 
 
-# ================== 2. 定义 Suspend 模型 ==================
-class Suspend(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(Suspend, self).__init__()
-        self.the_in = nn.Linear(input_size, hidden_size)
-        self.inside = nn.Linear(hidden_size, hidden_size)
-        self.output_layer = nn.Linear(hidden_size, output_size)
-        self.attention = LocalAttention(hidden_size)
-        self.suspend_state = nn.Linear(hidden_size, hidden_size)
-        self.tanh = nn.Tanh()
-
-    def forward(self, x):
-        seq_len, batch_size, _ = x.size()
-        hidden_size = self.inside.weight.shape[0]
-
-        watch = torch.zeros(seq_len, batch_size, hidden_size).to(x.device)
-        sus = torch.zeros(seq_len, batch_size, hidden_size).to(x.device)
-
-        outputs = []
-
-        for cursor in range(seq_len):
-            read = x[cursor]
-            read = self.attention(read)
-            watch = self.tanh(self.the_in(read) + self.inside(watch))
-            sus = self.tanh(self.suspend_state(watch) + sus)
-
-            output = self.output_layer(watch)
-            outputs.append(output.unsqueeze(0))
-
-        return torch.cat(outputs, dim=0), watch, sus
+def load_model(model_path, voc_size, output_size):
+    """
+    加载训练好的模型权重
+    :param model_path: 模型权重路径
+    :param voc_size: 词汇表大小
+    :param output_size: 输出维度
+    :return: 加载后的模型
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = Suspend(voc_size=voc_size, output_size=output_size).to(device)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()  # 设置为评估模式
+    print(f"模型已加载：{model_path}")
+    return model
 
 
-# ================== 3. 模型封装 ==================
-class SuspendWrapper(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_size, output_size):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.suspend = Suspend(embed_dim, hidden_size, output_size)
+def predict(model, input_seq):
+    """
+    使用模型进行预测
+    :param model: 训练好的模型
+    :param input_seq: 输入序列 (tensor)
+    :return: 预测结果
+    """
+    device = next(model.parameters()).device  # 获取模型所在设备
+    input_seq = input_seq.to(device)
 
-    def forward(self, x):
-        x = self.embedding(x)
-        out, _, _ = self.suspend(x)
-        return out.mean(dim=0)
+    with torch.no_grad():
+        logits = model(input_seq)
+        predictions = torch.argmax(logits, dim=-1)
+
+    return predictions.cpu().numpy()
 
 
-# ================== 4. 加载模型 ==================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def prepare_input(text, encoder):
+    """
+    将输入文本编码为 token ID 序列
+    :param text: 输入文本
+    :param encoder: 编码器
+    :return: tensor 格式的 token ID 序列
+    """
+    tokens = encoder.encode(text)
+    input_tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)  # 添加 batch 维度
+    return input_tensor
 
-# 模型配置
-model = SuspendWrapper(vocab_size=10000, embed_dim=32, hidden_size=64, output_size=4).to(device)
-model.load_state_dict(torch.load("suspend_model.pth"))
-model.eval()
 
-# ================== 5. 测试推理 ==================
-test_iter = AG_NEWS(split="test")
-test_loader = DataLoader(list(test_iter)[:100], batch_size=16, collate_fn=collate_batch)
+def main():
+    # 参数设置
+    model_path = "suspend_imdb_model.pth"
+    vocab_size = tiktoken.get_encoding("cl100k_base").n_vocab
+    output_size = vocab_size
 
-correct = 0
-total = 0
+    # 加载模型
+    model = load_model(model_path, vocab_size, output_size)
 
-with torch.no_grad():
-    for texts, labels, _ in test_loader:
-        texts, labels = texts.to(device), labels.to(device)
-        outputs = model(texts)
-        predicted = torch.argmax(outputs, dim=1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
+    # 初始化编码器
+    encoder = tiktoken.get_encoding("cl100k_base")
 
-print(f"Test Accuracy: {correct / total:.4f}")
+    # 示例输入
+    input_text = "This is a test input for the Suspend model."
+    input_seq = prepare_input(input_text, encoder)
+
+    # 进行预测
+    predictions = predict(model, input_seq)
+
+    # 解码预测结果
+    predicted_text = encoder.decode(predictions[0])
+    print(f"输入文本：{input_text}")
+    print(f"预测结果：{predicted_text}")
+
+
+if __name__ == "__main__":
+    main()

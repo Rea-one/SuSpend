@@ -1,40 +1,55 @@
 import torch
 import torch.nn as nn
 
+from torch.nn import functional as F
+
 from attention import LocalAttention
 
 
 class Suspend(nn.Module):
-    def __init__(self, hidden_size, output_size, cursor_size = 16):
+    def __init__(self, voc_size, output_size, hidden_size=64, cursor_size = 16):
         super(Suspend, self).__init__()
         
         self.cursor_size = cursor_size
+        self.hidden_size = hidden_size
         
-        self.attention = LocalAttention(self.cursor_size)
-        self.suspend = nn.Linear(hidden_size + self.cursor_size, hidden_size)
-        self.determin = nn.Linear(cursor_size, output_size)
+        self.embedding = nn.Embedding(voc_size, cursor_size)
+        
+        self.attention = LocalAttention(cursor_size)
+        self.suspend = nn.Linear(hidden_size + cursor_size, hidden_size)
+        self.determin = nn.Linear(hidden_size + cursor_size, output_size)
         # 激活函数
         self.tanh = nn.Tanh()
         
     def forward(self, x, sus=None):
-        """
-        x: 输入序列，形状为 (seq_len, batch_size, input_size)
-        """
-        seq_len, batch_size, _ = x.size()
-        hidden_size = self.inside.weight.shape[0]
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
 
+        batch_size, seq_len = x.size()
+        
         # 初始化悬置体
         if sus is None:
-            sus = torch.zeros(seq_len, batch_size, hidden_size + self.cursor_size).to(x.device)
+            sus = torch.zeros(batch_size, self.cursor_size, self.hidden_size).to(x.device)
+
         outputs = []
+
         for cursor in range(0, seq_len, self.cursor_size):
+            end = min(cursor + self.cursor_size, seq_len)
+            current_x = x[:, cursor:end]
+
+            # 嵌入层
+            read = self.embedding(current_x)
             
-            # 初始版
-            read = x[cursor:  cursor + self.cursor_size]
+            # 注意力机制
             watch = self.attention(read)
-            sus = self.tanh(self.suspend(watch + sus))
-            output = self.determin(watch)
-            outputs.append(output)
+
+            combined = torch.cat([watch, sus], dim=-1)
             
-        return torch.stack(outputs)
-        
+            sus = self.tanh(self.suspend(combined))
+
+            # 输出
+            output = self.determin(combined)
+            outputs.append(output)
+
+        # 拼接所有输出
+        return torch.cat(outputs, dim=1)

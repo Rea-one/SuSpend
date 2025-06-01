@@ -5,7 +5,7 @@ import json
 
 input_file_path = os.path.join(os.path.dirname(__file__), "2021-43_zh_head_0000-0.01.jsonl")
 data = ""
-with open(input_file_path, "r") as f:
+with open(input_file_path, "r", encoding="utf_8") as f:
     for line in f:
         obj = json.loads(line.strip())
         data += obj["text"] + "\n\n"

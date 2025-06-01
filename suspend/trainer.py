@@ -1,174 +1,143 @@
-# trainer.py
+import os
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import LabelEncoder
-from datasets import load_dataset
+import tiktoken
+import tqdm
+from tqdm import trange
 
 from suspend import Suspend
 
-
-# ================== 1. 自定义 Dataset ==================
-class HFDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer=None, vocab=None, max_length=128):
-        self.hf_dataset = hf_dataset
-        self.tokenizer = tokenizer if tokenizer else lambda x: x.split()
-        self.max_length = max_length
-
-        # 构建标签编码器
-        self.label_encoder = LabelEncoder()
-        self.labels = [item['label'] for item in hf_dataset]
-        self.label_encoder.fit(self.labels)
-
-        # 构建词汇表或传入外部词汇表
-        if vocab is None:
-            self.vocab = self.build_vocab([self.tokenizer(item['text']) for item in hf_dataset])
-        else:
-            self.vocab = vocab
-
-    def build_vocab(self, token_sequences):
-        vocab = {}
-        idx = 0
-        for tokens in token_sequences:
-            for token in tokens:
-                if token not in vocab:
-                    vocab[token] = idx
-                    idx += 1
-        vocab["<unk>"] = idx  # 添加 <unk>
-        return vocab
-
-    def __len__(self):
-        return len(self.hf_dataset)
-
-    def __getitem__(self, idx):
-        item = self.hf_dataset[idx]
-        tokens = self.tokenizer(item['text'])
-        token_ids = [self.vocab.get(token, self.vocab["<unk>"]) for token in tokens[:self.max_length]]
-        token_tensor = torch.tensor(token_ids, dtype=torch.long)
-        label_tensor = torch.tensor(self.label_encoder.transform([item['label']])[0], dtype=torch.long)
-        length_tensor = torch.tensor(len(token_tensor), dtype=torch.int64)
-        return token_tensor, label_tensor, length_tensor
-
-
-# ================== 2. 自定义 collate 函数 ==================
-def collate_batch(batch):
-    texts, labels, lengths = zip(*batch)
-    texts = pad_sequence(texts, batch_first=False, padding_value=0)
-    labels = torch.stack(labels)
-    lengths = torch.stack(lengths)
-    return texts, labels, lengths
-
-
-# ================== 3. 加载并封装 Suspend 模型 ==================
-class SuspendWrapper(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_size, output_size, cursor_size=16):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.suspend = Suspend(hidden_size=hidden_size, output_size=output_size, cursor_size=cursor_size)
-        self.hidden_size = hidden_size
+# ================== 数据集定义 ==================
+class BinDataset(Dataset):
+    def __init__(self, data_path, block_size, cursor_size=16):
+        self.data = np.fromfile(data_path, dtype=np.uint32)
+        self.block_size = block_size
         self.cursor_size = cursor_size
 
-    def forward(self, x):
-        # x shape: (seq_len, batch_size)
-        x = self.embedding(x)  # -> (seq_len, batch_size, embed_dim)
-        x = x.transpose(0, 1)  # -> (batch_size, seq_len, embed_dim)
-        batch_size, seq_len, embed_dim = x.shape
+    def __len__(self):
+        return len(self.data) // self.block_size
 
-        # 分块处理（滑动窗口）
-        windows = [x[i:i + self.cursor_size] for i in range(0, seq_len, self.cursor_size)]
-        from torch.nn.utils.rnn import pad_sequence
-        windows = [pad_sequence(win, batch_first=True, padding_value=0) for win in windows]
-        x = torch.stack(windows)  # -> (num_windows, cursor_size, batch_size, embed_dim)
-        x = x.view(-1, batch_size, embed_dim)  # -> (num_windows * cursor_size, batch_size, embed_dim)
+    def __getitem__(self, idx):
+        start = idx * self.block_size
+        end = start + self.block_size
+        x = torch.tensor(self.data[start:end], dtype=torch.long)
 
-        out = self.suspend(x)
-        return out.mean(dim=0)
+        # 自动填充到 cursor_size 的整数倍
+        pad_len = (self.cursor_size - (x.size(0) % self.cursor_size)) % self.cursor_size
+        if pad_len > 0:
+            x = F.pad(x, (0, pad_len), value=0)  # 假设 0 是 <pad> token
 
+        y = torch.tensor(self.data[start+1:end+1], dtype=torch.long)
+        if pad_len > 0:
+            y = F.pad(y, (0, pad_len), value=0)
 
-# ================== 4. 加载 HuggingFace 数据集（IMDB）==================
-dataset = load_dataset("imdb")
-
-# 取部分数据用于快速训练（可选）
-train_dataset = HFDataset(dataset['train'].shuffle(seed=42).select(range(10000)))
-val_dataset = HFDataset(dataset['test'].shuffle(seed=42).select(range(2000)))
-
-# 创建 DataLoader
-BATCH_SIZE = 16
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_batch)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
-
-vocab_size = len(train_dataset.vocab)  # 自动推断词汇表大小
-OUTPUT_SIZE = len(set([d['label'] for d in dataset['train']]))  # 自动推断类别数
+        return x, y
 
 
-# ================== 5. 初始化模型、优化器、损失函数 ==================
+BATCH_SIZE = 1
+BLOCK_SIZE = 128
+
+# 加载训练和验证数据集
+train_dataset = BinDataset('data/train.bin', BLOCK_SIZE)
+val_dataset = BinDataset('data/val.bin', BLOCK_SIZE)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+vocab_size = tiktoken.get_encoding("cl100k_base").n_vocab
+OUTPUT_SIZE = vocab_size
+
+
+# ================== 初始化模型、优化器、损失函数 ==================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = SuspendWrapper(vocab_size, embed_dim=32, hidden_size=64, output_size=OUTPUT_SIZE, cursor_size=8).to(device)
+model = Suspend(voc_size=vocab_size, output_size=OUTPUT_SIZE).to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 
+# ================== 添加模型保存相关配置 ==================
+save_interval = 1  # 每隔几个 epoch 保存一次模型
+save_dir = "checkpoints"
+os.makedirs(save_dir, exist_ok=True)
 
-# ================== 6. 训练函数 ==================
+
+# ================== 训练函数 ==================
 def train(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
-
-    for texts, labels, _ in dataloader:
-        texts, labels = texts.to(device), labels.to(device)
+    
+    # 使用 tqdm 包裹 dataloader
+    progress_bar = tqdm(dataloader, desc="Training", leave=False)
+    
+    for x, y in progress_bar:
+        x, y = x.to(device), y.to(device)
 
         optimizer.zero_grad()
-        outputs = model(texts)
-        loss = criterion(outputs, labels)
+        logits = model(x)
+        loss = criterion(logits.view(-1, vocab_size), y.view(-1))
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        predicted = torch.argmax(outputs, dim=1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
+        
+        # 更新正确预测的数量
+        predictions = torch.argmax(logits, dim=-1)
+        correct += (predictions == y).sum().item()
+        total += y.numel()
+
+        # 实时更新进度条描述
+        avg_loss = total_loss / len(progress_bar)
+        accuracy = correct / total
+        progress_bar.set_postfix(loss=avg_loss, accuracy=accuracy)
 
     avg_loss = total_loss / len(dataloader)
     accuracy = correct / total
     print(f"Train Loss: {avg_loss:.4f} | Accuracy: {accuracy:.4f}")
     return avg_loss, accuracy
 
-
-# ================== 7. 验证函数 ==================
+    
+# ================== 验证函数 ==================
 def evaluate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0
     correct = 0
     total = 0
-
     with torch.no_grad():
-        for texts, labels, _ in dataloader:
-            texts, labels = texts.to(device), labels.to(device)
-            outputs = model(texts)
-            loss = criterion(outputs, labels)
-
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = criterion(logits.view(-1, vocab_size), y.view(-1))
             total_loss += loss.item()
-            predicted = torch.argmax(outputs, dim=1)
-            correct += (predicted == labels).sum().item()
-            total += labels.size(0)
+            
+            # 更新正确预测的数量
+            predictions = torch.argmax(logits, dim=-1)
+            correct += (predictions == y).sum().item()
+            total += y.numel()
 
     avg_loss = total_loss / len(dataloader)
     accuracy = correct / total
     print(f"Val Loss: {avg_loss:.4f} | Accuracy: {accuracy:.4f}")
     return avg_loss, accuracy
+    
 
-
-# ================== 8. 开始训练 ==================
+# ================== 开始训练 ==================
 EPOCHS = 5
 for epoch in range(EPOCHS):
-    print(f"\nEpoch {epoch+1}/{EPOCHS}")
+    print(f"\训练进度 {epoch+1}/{EPOCHS}")
     train_loss, train_acc = train(model, train_loader, criterion, optimizer, device)
     val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+    
+    # ================== 添加模型保存逻辑 ==================
+    if (epoch + 1) % save_interval == 0:
+        model_save_path = os.path.join(save_dir, f"suspend_model_epoch_{epoch+1}.pth")
+        torch.save(model.state_dict(), model_save_path)
+        print(f"第 {epoch+1} 轮训练完成，模型已保存到 {model_save_path}")
 
 
-# ================== 9. 保存模型 ==================
-torch.save(model.state_dict(), "suspend_imdb_model.pth")
-print("Suspend 模型已保存！")
+# ================== 保存最终模型 ==================
+torch.save(model.state_dict(), "Suspend_final.pth")
+print("最终 Suspend 模型已保存！")
