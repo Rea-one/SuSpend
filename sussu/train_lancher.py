@@ -36,7 +36,7 @@ def main():
     # 模型
     model = SuspendStack(voc_size=vocab_size, output_size=OUTPUT_SIZE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
+    
     start_epoch = 0
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, None, args.resume)

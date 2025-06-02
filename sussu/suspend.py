@@ -11,8 +11,6 @@ class Sus(nn.Module):
     def __init__(self, input_size, output_size, hidden_size=64):
         super(Sus, self).__init__()
         
-        self.sus = None
-        
         self.input_size = input_size
         self.hidden_size = hidden_size
         
@@ -29,30 +27,26 @@ class Sus(nn.Module):
     def forward(self, x, sus=None):        
         
         # 初始化悬置体
-        if self.sus is None:
-            self.sus = sus
-        
-        if self.sus is None and sus is None:
+        if sus is None:
             batch_size, seq_len, voc_size = x.shape
-            self.sus = torch.zeros(batch_size, seq_len, self.hidden_size).to(x.device)
-            
+            sus = torch.zeros(batch_size, seq_len, self.suspend.out_features).to(x.device)
         
         # 注意力机制
         watch = self.attention(x)
         watch = self.lim(watch)
         watch = self.dropout(watch)
 
-        combined = torch.cat([self.sus, watch], dim=-1)
+        combined = torch.cat([sus, watch], dim=-1)
         
-        self.sus = self.activate(self.suspend(combined))
-        self.sus = self.doubt(self.sus)
+        new_sus = self.activate(self.suspend(combined))
+        new_sus = self.doubt(new_sus)
 
         # 输出
         output = self.determin(combined)
         output = self.check(output)
 
         # 拼接所有输出
-        return output  
+        return output, new_sus
         
 
 class SusTail(nn.Module):
@@ -67,7 +61,7 @@ class SusTail(nn.Module):
 
         
 class SuspendStack(nn.Module):
-    def __init__(self, voc_size, output_size, scale=4, hidden_size=64, cursor_size=16):
+    def __init__(self, voc_size, output_size, scale=8, hidden_size=128, cursor_size=8):
         super(SuspendStack, self).__init__()
         
         self.cursor_size = cursor_size
@@ -85,13 +79,17 @@ class SuspendStack(nn.Module):
     def forward(self, x):
         batch_size, seq_len = x.shape
         
+        pad_length = (self.cursor_size - seq_len % self.cursor_size) % self.cursor_size
+        if pad_length > 0:
+            x = F.pad(x, (0, pad_length), value=0)
+        
         outputs = []
+        sus = None
         
         for order in range(0, seq_len, self.cursor_size):
-            window = x[:, order:order + self.cursor_size]
-            
+            window = x[:, order: order + self.cursor_size]
             read = self.embedding(window)
-            watch = self.head(read)
+            watch, sus = self.head(read, sus)
             ana = self.body(watch)
             output = self.tail(ana)
             outputs.append(output)
