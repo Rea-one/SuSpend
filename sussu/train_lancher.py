@@ -18,7 +18,7 @@ from utils import save_checkpoint, load_checkpoint, EarlyStopping
 
 def main():
     args = get_args()
-
+    
     # 设备设置
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -26,10 +26,10 @@ def main():
     # 数据集
     vocab_size = tiktoken.get_encoding("cl100k_base").n_vocab
     OUTPUT_SIZE = vocab_size
-
+    
     train_dataset = BinDataset('data/train.bin', block_size=128)
     val_dataset = BinDataset('data/val.bin', block_size=128)
-
+    
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True)
 
